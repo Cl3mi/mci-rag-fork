@@ -1,0 +1,39 @@
+name: philo-rag
+services:
+  app:
+    build: .
+    container_name: philo-rag
+    env_file:
+      - .env
+    environment:
+      - TOKENIZERS_PARALLELISM=true
+      - LANGCHAIN_TRACING_V2=true
+      - LANGCHAIN_PROJECT=onprem-rag
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./app/agent/chat_history.json:/app/app/agent/chat_history.json
+      - ./app/agent/faiss_ei:/app/app/agent/faiss_ei:ro
+    depends_on:
+      - ollama
+    restart: unless-stopped
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    # To enable GPU, uncomment and ensure Docker has GPU access
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  ollama:

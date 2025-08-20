@@ -1,0 +1,13 @@
+[
+  {
+    "role": "user",
+    "content": "What is the email address of the HR manager at Electronic Inc.?"
+  },
+  {
+    "role": "assistant",
+    "content": "The HR contact's email address is hr@electricinc.com, but it does not specify an extension number for the HR manager.",
+    "sources": [
+      "You’ll be escorted to your desk. IT will help you with login credentials, email setup, and \nphone configuration. \n3. Welcome Meeting \nMeet your manager and team in Conference Room A for a brief introduction and overview of \nyour role. \n \n3. Key Contacts \nRole Name Email Extension \nHiring Manager [Manager Name] [manager@electricinc.com] 1234 \nHR Partner [HR Contact] [hr@electricinc.com] 1100 \nIT Support Helpdesk helpdesk@electricinc.com 1001"
+    ]
+  }
+]
