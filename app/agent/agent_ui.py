@@ -18,6 +18,9 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_groq import ChatGroq
 import pandas as pd
 import pandasai as pdai
+from sqlalchemy import text, create_engine
+
+from db_helper import build_sql_prompt, get_db_schema
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -116,18 +119,23 @@ def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
     llm_json = get_llm_json(dev_mode)
     role = st.session_state.get("role", "manager")
 
+    DB_URL = os.getenv("DB_URL", "sqlite:///./electronic_inc.db")
+    engine = create_engine(DB_URL + "?mode=ro", future=True)
+    schemes = get_db_schema(engine)
     router_instructions = (
         "You are a smart router that decides whether a user question should be answered using one of the following options:\n"
         "1. internal company documents (vectorstore)\n"
         "2. structured CSV data (csv)\n"
         "3. web search (websearch)\n\n"
+        "4. sql database (sqldatabase)\n\n"
 
         "Routing Rules:\n"
-        "- If the question is about Electronic Inc.'s company history, strategy, values, or internal documentation, return: {\"result\": \"vectorstore\"}.\n"
+        "- If the question is about Electronic Inc.'s company history, strategy, values, or internal documentation, or person information return: {\"result\": \"vectorstore\"}.\n"
         "- If the question involves numerical data, trends, sales figures, costs, or anything typically found in spreadsheets or tables, return: {\"result\": \"csv\"}.\n"
         "- If the question is general, unrelated to Electronic Inc., or about external entities, return: {\"result\": \"websearch\"}.\n\n"
+        "- If the question is about aggregations, or insights that can be obtained from a SQL database of staff and employees and infos about persons, like email, department, country, return: {\"result\": \"sqldatabase\"}.\n\n"
 
-        "Respond ONLY with a valid JSON object in the form: {\"result\": \"vectorstore\"}, {\"result\": \"csv\"}, or {\"result\": \"websearch\"}."
+        "Respond ONLY with a valid JSON object in the form: {\"result\": \"vectorstore\"}, {\"result\": \"csv\"}, or {\"result\": \"websearch\"}, {\"result\": \"sqldatabase\"}."
     )
 
     doc_grader_instructions = (
@@ -159,7 +167,15 @@ def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
         "CONTEXT:\n{context}\n\nQUESTION:\n{question}\n\nAnswer:"
     )
 
+    sql_prompt = (
+        "You are an expert SQL generator. Given a user question, generate an appropriate SQL query to retrieve the necessary data from the database.\n"
+        "Only generate SELECT queries. Do not include any explanations or additional text, only the SQL query.\n"
+        "If the question is not answerable with SQL, respond with: NO_SQL.\n\n"
+        "User Question: {question}\n\nSQL Query:"
+    )
+
     # Define action functions
+
     def format_docs(docs: List[Document]) -> str:
         return "\n\n".join(doc.page_content for doc in docs)
 
@@ -172,10 +188,54 @@ def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
         print(f"Routing decision: {msg}")
         return msg.get("result", "vectorstore")
 
+    def execute_query(query: str):
+        with engine.connect() as conn:
+            result = conn.execute(text(query))
+            if result.returns_rows:  # Check if the query returns rows
+                df = pd.DataFrame(result.fetchall(), columns=result.keys())
+                return df
+            else:
+                return None
+
+    def format_sql_result(df: pd.DataFrame) -> str:
+        if df.shape[1] == 1:
+            return "\n".join(map(str, df.iloc[:, 0].tolist()))
+        # Multi-column → pretty table without index
+        return df.to_string(index=False)
+
+    def sql_analysis(state):
+        prompt = build_sql_prompt(state["question"], schemes)
+        sql_response = llm.invoke([HumanMessage(content=prompt)])
+        sql_query = sql_response.content.strip().rstrip(";")
+        print(f"Generated SQL query: {sql_query}")
+        if sql_query == "NO_SQL":
+            return {
+                "documents": state.get("documents", []) + [Document(page_content="No relevant SQL query could be generated.")],
+                "question": state["question"],
+                "max_retries": state["max_retries"],
+                "generation": "",
+                "loop_step": state.get("loop_step", 0),
+                "web_search": "no"
+            }
+        try:
+            df = execute_query(sql_query)
+            if df is None or df.empty:
+                answer = "The SQL query returned no results."
+            else:
+                answer = format_sql_result(df.head(5))
+        except Exception as e:
+            answer = f"Error executing SQL query: {e}"
+        print(f"SQL analysis answer: {answer}")
+        answer_string = f"SQL analysis answer to the question {state['question']} is: {answer}"
+        return {
+            "documents": state.get("documents", []) + [Document(page_content=answer_string)]
+        }
+
+
     def analyze_csv(csv_file: str, question: str):
         data = pd.read_csv(csv_file)
         schema = ", ".join(data.columns)
-        full_prompt = f"The CSV contains columns: {schema}. {question}. Also provide the context like the row where its found or the number of rows used to get the result."
+        full_prompt = f"The CSV contains columns: {schema}. {question}. Also provide the answer in a maximum of 10 sentences."
         df = pdai.SmartDataframe(data, config={"llm": llm, "verbose": True})
         return df.chat(full_prompt)
 
@@ -201,7 +261,7 @@ def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
         print(f"CSV search answer: {answer}")
         answer_string = f"CSV search answer to the question {state['question']} is: {answer}"
         return {
-            "documents": state.get("documents", []) + [Document(page_content=answer_string)]
+            "documents": state.get("documents", []) + [Document(page_content=answer_string, metadata={"source": source})]
         }
 
     def retrieve(state):
@@ -239,7 +299,7 @@ def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
         hits = web_search_tool.invoke({"query": state["question"]})
         docs = []
         for hit in hits:
-            docs.append(Document(page_content=hit["content"], metadata={"source": hit["url"]}))
+            docs.append(Document(page_content=hit["content"],  metadata={"source": hit["url"], "title": hit.get("title", "")}))
         return {"documents": state.get("documents", []) + docs, "web_search": "yes"}
 
     def decide_generate(state):
@@ -269,17 +329,20 @@ def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
     graph.add_node("websearch", web_search)
     graph.add_node("retrieve", retrieve)
     graph.add_node("csv_search", csv_search)
+    graph.add_node("sql_analysis", sql_analysis)
     graph.add_node("grade_documents", grade_documents)
     graph.add_node("generate", generate)
 
     graph.set_conditional_entry_point(route_question, {
         "websearch": "websearch",
         "vectorstore": "retrieve",
-        "csv": "csv_search"
+        "csv": "csv_search",
+        "sqldatabase": "sql_analysis"
     })
     graph.add_edge("websearch", "generate")
     graph.add_edge("retrieve", "grade_documents")
     graph.add_edge("csv_search", "generate")
+    graph.add_edge("sql_analysis", "generate")
     graph.add_conditional_edges("grade_documents", decide_generate, {
         "websearch": "websearch",
         "generate": "generate"
