@@ -12,7 +12,8 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from langchain_ollama.embeddings import OllamaEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
-from langchain.schema import Document
+from langchain_core.documents import Document
+#from langchain.schema import Document
 from langgraph.graph import StateGraph, START, END
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_groq import ChatGroq
