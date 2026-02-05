@@ -5,6 +5,9 @@ services:
     image: ollama/ollama:latest
     container_name: ollama
     restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     ports:
       - "11434:11434"
     volumes:
@@ -15,8 +18,11 @@ services:
     container_name: ollama-init
     depends_on:
       - ollama
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     environment:
-    - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_HOST=http://ollama:11434
     volumes:
       - ollama:/root/.ollama
     entrypoint: >
@@ -32,18 +38,24 @@ services:
   app:
     build: .
     container_name: philo-rag-app
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     env_file:
       - .env
     environment:
       - TOKENIZERS_PARALLELISM=true
       - LANGCHAIN_TRACING_V2=false
-      - LANGCHAIN_PROJECT=onprem-rag
+      - LANGCHAIN_TRACING=false
+      - DO_NOT_TRACK=1
+      # HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE removed to allow initial model download
       - OLLAMA_HOST=http://ollama:11434
     ports:
       - "8501:8501"
     volumes:
       - ./app/agent/chat_history.json:/app/app/agent/chat_history.json
-      - ./app/agent/faiss_ei:/app/app/agent/faiss_ei:ro
+      - ./app/agent/faiss_ei:/app/app/agent/faiss_ei  # Removed :ro to allow index rebuilds
+      - ./app/agent/data:/app/app/agent/data:ro  # Mount data folder for new documents
     depends_on:
       ollama-init:
         condition: service_completed_successfully

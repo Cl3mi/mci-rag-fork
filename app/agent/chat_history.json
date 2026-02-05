@@ -1,13 +1,16 @@
 [
   {
     "role": "user",
-    "content": "What is the email address of the HR manager at Electronic Inc.?"
+    "content": "what do you know about the lastenheft"
   },
   {
     "role": "assistant",
-    "content": "The HR contact's email address is hr@electricinc.com, but it does not specify an extension number for the HR manager.",
+    "content": "The Lastenheft (German for \"load sheet\" or \"bill of goods\") is a document that outlines the rules and regulations for the Advanced Integrative Project in the Master's program Digital Business & Software Engineering at WS 2025/26. It appears to be related to the game \"Das verrückte Labyrinth\" (The Crazy Labyrinth), which is based on the original Ravensburger game. The Lastenheft includes rules for gameplay, such as movement and interaction with other players, as well as information about bonuses that can be earned during the game. It also mentions a protocol for tracking the game's progress, which should be visible in the server window.",
     "sources": [
-      "You’ll be escorted to your desk. IT will help you with login credentials, email setup, and \nphone configuration. \n3. Welcome Meeting \nMeet your manager and team in Conference Room A for a brief introduction and overview of \nyour role. \n \n3. Key Contacts \nRole Name Email Extension \nHiring Manager [Manager Name] [manager@electricinc.com] 1234 \nHR Partner [HR Contact] [hr@electricinc.com] 1100 \nIT Support Helpdesk helpdesk@electricinc.com 1001"
+      "Lastenheft: Das verrückte Labyrinth\nAdvanced Integrative Project\nMaster\nDigital Business & Software Engineering\nWS 2025/26",
+      "• Ein Spieler darf während seines Zuges über einen anderen Spieler laufen.\n• Ein Spieler darf während seines Zuges nicht die Richtung wechseln oder nachdem er stehengeblieben\nist weiterlaufen.\n• Der Spieler darf sich ansonsten so bewegen wie im Originalspiel von Ravensburg angegeben.\nBoni\nWährend des Spiels können zufällig (konfigurierbar) Boni erscheinen, die von Spieler eingesammelt wer-\nden können.\nBoni sind:\n•Beamen:Beamt den Spieler einmal an eine beliebige Stelle.",
+      "Kommt es in diesem Szenario dazu, dass ein Client durch Netzwerkprobleme oder wegen Fehlern auf eine\nServeranfrage länger als 30 Sekunden (gemessen auf dem Server) nicht antwortet, wird dieser Spieler vom\nServer mit einem Countdown von 3 Sekunden entfernt.\nDer Server soll darüber hinaus in geeigneter Weise den Spielverlauf nachvollziehbar protokollieren. Dieses\nProtokoll soll dabei mindestens immer im Serverfenster sichtbar sein.",
+      "haben. Danach können auch weitere Clients dem Spiel beitreten.\n1https://de.wikipedia.org/wiki/Das_verr%C3%BCckte_Labyrinth\n2https://www.ravensburger.de/spielanleitungen/ecm/Spielanleitungen/26446%20anl%\n201637944.pdf?ossl=pds_text_Spielanleitung\n1"
     ]
   }
 ]

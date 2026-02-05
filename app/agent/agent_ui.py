@@ -1,6 +1,8 @@
 import os
+import hashlib
 import getpass
 import json
+from pathlib import Path
 from typing import List, TypedDict
 import streamlit as st
 from langchain_community.callbacks.streamlit import (
@@ -8,6 +10,8 @@ from langchain_community.callbacks.streamlit import (
 )
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, CSVLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from langchain_ollama.embeddings import OllamaEmbeddings
@@ -15,10 +19,13 @@ from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
 from langchain_core.documents import Document
 #from langchain.schema import Document
 from langgraph.graph import StateGraph, START, END
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_groq import ChatGroq
+# DISABLED: Web search - we run fully offline
+# from langchain_community.tools.tavily_search import TavilySearchResults
+# DISABLED: Cloud LLM - we use local Ollama only
+# from langchain_groq import ChatGroq
 import pandas as pd
-import pandasai as pdai
+# DISABLED: PandasAI may phone home - use plain pandas instead
+# import pandasai as pdai
 from sqlalchemy import text, create_engine
 
 from db_helper import build_sql_prompt, get_db_schema
@@ -39,12 +46,183 @@ def set_env(var: str):
 
 
 load_dotenv()
-set_env("TAVILY_API_KEY")
-set_env("LANGSMITH_API_KEY")
-set_env("GROQ_API_KEY")
+# DISABLED: External API keys - we run fully offline
+# set_env("TAVILY_API_KEY")
+# set_env("LANGSMITH_API_KEY")
+# set_env("GROQ_API_KEY")
+
+# Disable ALL telemetry and tracing to prevent data leakage
+# These MUST be set after load_dotenv() to override any .env values
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_PROJECT"] = "onprem-rag"
+os.environ["LANGCHAIN_TRACING_V2"] = "false"  # Disable LangSmith tracing v2
+os.environ["LANGCHAIN_TRACING"] = "false"     # Disable LangSmith tracing v1
+os.environ["LANGSMITH_TRACING"] = "false"     # Another LangSmith flag
+os.environ["DO_NOT_TRACK"] = "1"              # Disable LangChain anonymous telemetry
+# Remove API keys from environment to prevent accidental use
+for key in ["LANGCHAIN_API_KEY", "LANGSMITH_API_KEY", "TAVILY_API_KEY", "GROQ_API_KEY"]:
+    os.environ.pop(key, None)
+# NOTE: HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE removed to allow model downloads
+# After models are cached, you can re-enable these for fully offline operation:
+# os.environ["HF_HUB_OFFLINE"] = "1"
+# os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
+# =============================================================================
+# Auto-detect and vectorize new documents from data/ directory
+# =============================================================================
+
+DATA_DIR = os.path.join(BASE_DIR, "data")
+FAISS_DIR = os.path.join(BASE_DIR, "faiss_ei")
+MANIFEST_FILE = os.path.join(FAISS_DIR, ".manifest.json")
+
+
+def compute_file_hash(filepath: str) -> str:
+    """Compute MD5 hash of a file for change detection."""
+    hasher = hashlib.md5()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def scan_data_directory(data_dir: str) -> dict:
+    """Scan data directory and return dict of {filepath: hash}."""
+    if not os.path.exists(data_dir):
+        return {}
+
+    file_hashes = {}
+    data_path = Path(data_dir)
+    exclude_patterns = ['.DS_Store', '.ipynb_checkpoints', '*.pyc', '__pycache__']
+
+    for file in data_path.rglob('*'):
+        if not file.is_file():
+            continue
+        if any(file.match(pattern) for pattern in exclude_patterns):
+            continue
+        # Only process supported file types
+        if file.suffix.lower() in ['.pdf', '.csv', '.txt', '.md']:
+            file_hashes[str(file.absolute())] = compute_file_hash(str(file))
+
+    return file_hashes
+
+
+def load_manifest() -> dict:
+    """Load the manifest of previously indexed files."""
+    if os.path.exists(MANIFEST_FILE):
+        with open(MANIFEST_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_manifest(manifest: dict):
+    """Save the manifest of indexed files."""
+    os.makedirs(os.path.dirname(MANIFEST_FILE), exist_ok=True)
+    with open(MANIFEST_FILE, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def load_documents_from_files(file_paths: List[str]) -> List[Document]:
+    """Load documents from a list of file paths."""
+    documents = []
+    for filepath in file_paths:
+        file = Path(filepath)
+        try:
+            if file.suffix.lower() == '.pdf':
+                loader = PyPDFLoader(str(file))
+            elif file.suffix.lower() == '.csv':
+                loader = CSVLoader(str(file), encoding='utf-8')
+            else:  # .txt, .md, etc.
+                loader = TextLoader(str(file), encoding='utf-8')
+            documents.extend(loader.load())
+            print(f"Loaded: {file.name}")
+        except Exception as e:
+            print(f"Error loading {file}: {e}")
+    return documents
+
+
+def chunk_documents(documents: List[Document], chunk_size: int = 512, chunk_overlap: int = 128) -> List[Document]:
+    """Split documents into chunks for embedding."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
+    chunked = []
+    for doc in documents:
+        chunked.extend(splitter.split_documents([doc]))
+    return chunked
+
+
+def rebuild_faiss_index(embedding_model, data_dir: str, faiss_dir: str) -> FAISS:
+    """Rebuild the entire FAISS index from the data directory."""
+    file_hashes = scan_data_directory(data_dir)
+    if not file_hashes:
+        print("No documents found in data directory.")
+        return None
+
+    print(f"Building FAISS index from {len(file_hashes)} files...")
+    documents = load_documents_from_files(list(file_hashes.keys()))
+    if not documents:
+        print("No documents could be loaded.")
+        return None
+
+    chunked = chunk_documents(documents)
+    print(f"Created {len(chunked)} chunks from {len(documents)} documents.")
+
+    db = FAISS.from_documents(chunked, embedding_model)
+    db.save_local(faiss_dir)
+    save_manifest(file_hashes)
+    print(f"FAISS index saved to {faiss_dir}")
+    return db
+
+
+def check_and_update_faiss_index(dev_mode: bool) -> bool:
+    """
+    Check if data/ directory has new or modified files.
+    Returns True if index was rebuilt, False otherwise.
+    """
+    if not os.path.exists(DATA_DIR):
+        print(f"Data directory not found: {DATA_DIR}")
+        print("Create 'data/' folder and add PDF/CSV/TXT files to auto-index them.")
+        return False
+
+    current_files = scan_data_directory(DATA_DIR)
+    if not current_files:
+        print("No indexable files found in data/ directory.")
+        return False
+
+    old_manifest = load_manifest()
+
+    # Check for changes
+    new_files = set(current_files.keys()) - set(old_manifest.keys())
+    removed_files = set(old_manifest.keys()) - set(current_files.keys())
+    modified_files = {
+        f for f in current_files
+        if f in old_manifest and current_files[f] != old_manifest[f]
+    }
+
+    if not (new_files or removed_files or modified_files):
+        print("No changes detected in data/ directory.")
+        return False
+
+    # Report changes
+    if new_files:
+        print(f"New files detected: {len(new_files)}")
+        for f in new_files:
+            print(f"  + {Path(f).name}")
+    if modified_files:
+        print(f"Modified files detected: {len(modified_files)}")
+        for f in modified_files:
+            print(f"  ~ {Path(f).name}")
+    if removed_files:
+        print(f"Removed files detected: {len(removed_files)}")
+        for f in removed_files:
+            print(f"  - {Path(f).name}")
+
+    # Rebuild index
+    print("Rebuilding FAISS index...")
+    embedding_model = get_embedding_model(dev_mode)
+    rebuild_faiss_index(embedding_model, DATA_DIR, FAISS_DIR)
+    return True
 
 
 def get_embedding_model(dev_mode: bool, model_name: str = 'nomic-embed-text'):
@@ -73,19 +251,12 @@ def filter_documents_by_role(documents: List[Document], role: str) -> List[Docum
 
 
 def get_llm(dev_mode: bool):
-    if dev_mode:
-        # Prefer Groq in dev mode when the API key is available; otherwise fallback to local Ollama
-        if os.getenv("GROQ_API_KEY"):
-            return ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=None, timeout=30, max_retries=2)
-        else:
-            st.warning("GROQ_API_KEY not set. Falling back to local Ollama for LLM.")
-            return ChatOllama(model="llama3.2:3b", temperature=0)
+    # Always use local Ollama - no cloud LLM to prevent data leakage
     return ChatOllama(model="llama3.2:3b", temperature=0)
 
 
 def get_llm_json(dev_mode: bool):
-    if dev_mode:
-        return get_llm(dev_mode).with_structured_output(method="json_mode")
+    # Always use local Ollama with JSON format - no cloud LLM
     return ChatOllama(model="llama3.2:3b", temperature=0, format="json")
 
 def to_json_dict(x, default=None):
@@ -110,12 +281,13 @@ class MyGraphState(TypedDict):
 # Build and cache the agent graph
 def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
     st.text("Loading model...")
-    # Load resources
+    # Load resources - fully offline, no external API calls
     embedding_model = get_embedding_model(dev_mode)
     db = FAISS.load_local(persist_directory, embedding_model, allow_dangerous_deserialization=True)
     retriever = get_retriever(db, k)
-    tavily_api_key = os.getenv("TAVILY_API_KEY")
-    web_search_tool = TavilySearchResults(k=3, tavily_api_key=tavily_api_key) if tavily_api_key else None
+    # DISABLED: Web search removed - we run fully offline
+    # tavily_api_key = os.getenv("TAVILY_API_KEY")
+    # web_search_tool = TavilySearchResults(k=3, tavily_api_key=tavily_api_key) if tavily_api_key else None
     llm = get_llm(dev_mode)
     llm_json = get_llm_json(dev_mode)
     role = st.session_state.get("role", "manager")
@@ -124,19 +296,18 @@ def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
     engine = create_engine(DB_URL + "?mode=ro", future=True)
     schemes = get_db_schema(engine)
     router_instructions = (
-        "You are a smart router that decides whether a user question should be answered using one of the following options:\n"
+        "You are a smart router that decides whether a user question should be answered using one of the following LOCAL data sources:\n"
         "1. internal company documents (vectorstore)\n"
         "2. structured CSV data (csv)\n"
-        "3. web search (websearch)\n\n"
-        "4. sql database (sqldatabase)\n\n"
+        "3. sql database (sqldatabase)\n\n"
 
         "Routing Rules:\n"
         "- If the question is about Electronic Inc.'s company history, strategy, values, or internal documentation, or person information return: {\"result\": \"vectorstore\"}.\n"
         "- If the question involves numerical data, trends, sales figures, costs, or anything typically found in spreadsheets or tables, return: {\"result\": \"csv\"}.\n"
-        "- If the question is general, unrelated to Electronic Inc., or about external entities, return: {\"result\": \"websearch\"}.\n\n"
-        "- If the question is about aggregations, or insights that can be obtained from a SQL database of staff and employees and infos about persons, like email, department, country, return: {\"result\": \"sqldatabase\"}.\n\n"
+        "- If the question is about aggregations, or insights that can be obtained from a SQL database of staff and employees and infos about persons, like email, department, country, return: {\"result\": \"sqldatabase\"}.\n"
+        "- For any other question, default to: {\"result\": \"vectorstore\"}.\n\n"
 
-        "Respond ONLY with a valid JSON object in the form: {\"result\": \"vectorstore\"}, {\"result\": \"csv\"}, or {\"result\": \"websearch\"}, {\"result\": \"sqldatabase\"}."
+        "Respond ONLY with a valid JSON object in the form: {\"result\": \"vectorstore\"}, {\"result\": \"csv\"}, or {\"result\": \"sqldatabase\"}."
     )
 
     doc_grader_instructions = (
@@ -234,11 +405,22 @@ def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
 
 
     def analyze_csv(csv_file: str, question: str):
+        """Analyze CSV using local LLM without PandasAI (which may phone home)."""
         data = pd.read_csv(csv_file)
         schema = ", ".join(data.columns)
-        full_prompt = f"The CSV contains columns: {schema}. {question}. Also provide the answer in a maximum of 10 sentences."
-        df = pdai.SmartDataframe(data, config={"llm": llm, "verbose": True})
-        return df.chat(full_prompt)
+        # Provide sample data and stats to the LLM for analysis
+        sample_rows = data.head(10).to_string(index=False)
+        stats = data.describe().to_string() if data.select_dtypes(include='number').shape[1] > 0 else "No numeric columns"
+
+        csv_prompt = (
+            f"You are analyzing a CSV file with the following columns: {schema}\n\n"
+            f"Sample data (first 10 rows):\n{sample_rows}\n\n"
+            f"Statistics:\n{stats}\n\n"
+            f"Question: {question}\n\n"
+            "Provide a concise answer in no more than 10 sentences based on the data above."
+        )
+        response = llm.invoke([HumanMessage(content=csv_prompt)])
+        return response.content
 
     def csv_search(state):
 
@@ -273,16 +455,18 @@ def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
         return {"documents": docs}
 
     def grade_documents(state):
-        filtered, flag = [], False
+        filtered = []
         for d in state.get("documents", []):
             prompt = f"Document: {d.page_content}\nQuestion: {state['question']}"
             resp_gd = llm_json.invoke([SystemMessage(content=doc_grader_instructions), HumanMessage(content=prompt)])
             resp_gd = to_json_dict(resp_gd, {"relevant": "no"})
             if resp_gd["relevant"] == "yes":
                 filtered.append(d)
-            else:
-                flag = True
-        return {"documents": filtered, "web_search": "yes" if not filtered else "no"}
+        # If no relevant docs found, keep original docs and let generate handle it
+        # NO web search fallback - we stay fully offline
+        if not filtered:
+            filtered = state.get("documents", [])
+        return {"documents": filtered, "web_search": "no"}
 
     def generate(state):
         ctx = format_docs(state["documents"])
@@ -290,21 +474,11 @@ def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
         gen = llm.invoke([HumanMessage(content=prompt)])
         return {"generation": gen.content, "loop_step": state.get("loop_step", 0) + 1}
 
-    def web_search(state):
-        if web_search_tool is None:
-            warning_doc = Document(
-                page_content="Web search is disabled because TAVILY_API_KEY is not set.",
-                metadata={"source": "tavily (disabled)"}
-            )
-            return {"documents": state.get("documents", []) + [warning_doc], "web_search": "no"}
-        hits = web_search_tool.invoke({"query": state["question"]})
-        docs = []
-        for hit in hits:
-            docs.append(Document(page_content=hit["content"],  metadata={"source": hit["url"], "title": hit.get("title", "")}))
-        return {"documents": state.get("documents", []) + docs, "web_search": "yes"}
+    # REMOVED: web_search function - we run fully offline
 
     def decide_generate(state):
-        return "websearch" if state.get("web_search") == "yes" else "generate"
+        # Always generate - no web search fallback
+        return "generate"
 
     def grade_generation(state):
         facts = format_docs(state["documents"])
@@ -321,38 +495,37 @@ def build_agent(dev_mode: bool, ac: bool, persist_directory: str, k: int):
         print(f"The score was {score} and {exp}")
         if score == "yes":
             return "useful"
+        # NO web search fallback - retry generation or end
         if state.get("loop_step", 0) < state.get("max_retries", 3):
-            return "not_useful"
+            return "not_supported"  # Retry generation instead of websearch
         return "max_retries"
 
-    # Build graph
+    # Build graph - FULLY OFFLINE, no websearch node
     graph = StateGraph(MyGraphState)
-    graph.add_node("websearch", web_search)
+    # REMOVED: graph.add_node("websearch", web_search)
     graph.add_node("retrieve", retrieve)
     graph.add_node("csv_search", csv_search)
     graph.add_node("sql_analysis", sql_analysis)
     graph.add_node("grade_documents", grade_documents)
     graph.add_node("generate", generate)
 
+    # Route only to local data sources - no websearch
     graph.set_conditional_entry_point(route_question, {
-        "websearch": "websearch",
         "vectorstore": "retrieve",
         "csv": "csv_search",
         "sqldatabase": "sql_analysis"
     })
-    graph.add_edge("websearch", "generate")
+    # REMOVED: graph.add_edge("websearch", "generate")
     graph.add_edge("retrieve", "grade_documents")
     graph.add_edge("csv_search", "generate")
     graph.add_edge("sql_analysis", "generate")
-    graph.add_conditional_edges("grade_documents", decide_generate, {
-        "websearch": "websearch",
-        "generate": "generate"
-    })
+    # Always go to generate - no websearch fallback
+    graph.add_edge("grade_documents", "generate")
     graph.add_conditional_edges("generate", grade_generation, {
-        "not_supported": "generate",
+        "not_supported": "generate",  # Retry generation
         "useful": END,
-        "not_useful": "websearch",
         "max_retries": END
+        # REMOVED: "not_useful": "websearch"
     })
     return graph.compile()
 
@@ -386,7 +559,29 @@ with st.sidebar:
         else:
             st.warning("No chat history file found to delete.")
 
+    st.divider()
+    st.subheader("Document Index")
+    # Show data directory status
+    if os.path.exists(DATA_DIR):
+        file_count = len(scan_data_directory(DATA_DIR))
+        st.caption(f"📁 {file_count} files in data/ folder")
+    else:
+        st.caption("📁 No data/ folder found")
+        st.info(f"Create folder: {DATA_DIR}")
+
+    if st.button("🔄 Reindex Documents"):
+        with st.spinner("Checking for document changes..."):
+            if check_and_update_faiss_index(st.session_state.get("dev_mode", False)):
+                st.success("Index rebuilt! Reloading agent...")
+                # Force agent reload
+                if "agent_graph" in st.session_state:
+                    del st.session_state.agent_graph
+                st.rerun()
+            else:
+                st.info("No changes detected.")
+
 dev_mode = st.sidebar.checkbox("Developer mode", False)
+st.session_state.dev_mode = dev_mode
 role = st.sidebar.selectbox("Role", ["manager", "employee"])
 if role != st.session_state.get("role", "manager"):
     st.session_state.role = role
@@ -394,6 +589,13 @@ if role != st.session_state.get("role", "manager"):
     #st.session_state.agent_graph = build_agent(dev_mode, True, "faiss_index_ac", 3)
     st.session_state.messages = []
 k = st.sidebar.number_input("Retriever top-k", min_value=1, max_value=10, value=3)
+
+# Auto-check for new documents on first load
+if "index_checked" not in st.session_state:
+    st.session_state.index_checked = True
+    with st.spinner("Checking for new documents..."):
+        if check_and_update_faiss_index(dev_mode):
+            st.toast("Document index updated!", icon="✅")
 
 # Initialize session state
 if "agent_graph" not in st.session_state:
