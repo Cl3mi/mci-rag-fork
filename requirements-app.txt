@@ -6,13 +6,10 @@ langchain-huggingface>=0.0.10
 langchain-ollama>=0.0.10
 langchain-groq>=0.0.10
 langgraph>=0.0.20
-pandas==1.5.3
 numpy==1.26.4
-pandasai==2.3.0
 faiss-cpu>=1.7.4
 sentence-transformers>=2.2.0
 python-dotenv>=1.0.0
-tavily-python>=0.3.0
 requests>=2.32.4
 pypdf>=3.0.0
 transformers>=4.35.0
